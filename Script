@@ -349,7 +349,7 @@ function loadCorpus(sh,idCols,txtCol){
 function onEdit(e){
   const map={
     'Completed Extractions -> Audit for delivery':{ cb:30, name:31 },
-    'Clean Solutions Audit':                       { cb:24, name:26 }
+    'Clean Solutions Audit':                       { cb:24, name:25 }
   };
   const cfg=map[e.range.getSheet().getName()]; if(!cfg) return;
   if(e.range.getColumn()!==cfg.cb) return;
