@@ -306,33 +306,62 @@ function cleanApprovedCompletedSolutions() {
   overwriteSheet(ss, CFG.SOL_PAUSE_SHEET, HEAD, pause);
 }
 
-/* ---------- U-Z override realignment ---------- */
+/* ------------------------------------------------------------------ */
+/*  U–Z override realignment  (Solutions Audit)                       */
+/*  Keeps all six columns together:                                   */
+/*    U task_id_copy                                                  */
+/*    V corrected_problem (or extracted_problem)                      */
+/*    W annotator_solution                                            */
+/*    X checkbox / manual flag                                        */
+/*    Y manual field (preserve)                                       */
+/*    Z auditor name (preserve)                                       */
+/* ------------------------------------------------------------------ */
 function syncSolutionsOverrides() {
-  const sh=SpreadsheetApp.getActive().getSheetByName(CFG.SOL_AUDIT_SHEET);
-  if(!sh) return;
-  const n=sh.getLastRow()-1; if(n<1) return;
+  const OV_START = 21;   // U
+  const OV_COLS  = 6;    // U…Z
 
-  const old=sh.getRange(2,21,n,6).getValues();     // U-Z existing
-  const map=new Map(); old.forEach(r=>{const k=String(r[0]).trim(); if(k) map.set(k,r);});
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(CFG.SOL_AUDIT_SHEET);
+  if (!sh) return;
 
-  const colA=sh.getRange(2,1,n).getValues(),  // task_id
-        colC=sh.getRange(2,3,n).getValues(),  // extracted_problem
-        colI=sh.getRange(2,9,n).getValues(),  // annotator_solution
-        colJ=sh.getRange(2,10,n).getValues(), // corrected_problem
-        colY=sh.getRange(2,25,n).getValues(), // Y manual
-        colZ=sh.getRange(2,26,n).getValues(); // Z manual
+  const last = sh.getLastRow();
+  if (last < 2) return;
 
-  const blk=[];
-  for(let i=0;i<n;i++){
-    const id=String(colA[i][0]).trim();
-    const prev=map.get(id)||Array(6).fill('');
-    const U=id;
-    const V=prev[1]||(colJ[i][0]&&String(colJ[i][0]).trim().toUpperCase()!=='N/A'?colJ[i][0]:colC[i][0]);
-    const W=prev[2]||colI[i][0];
-    blk.push([truncateValue(U),truncateValue(V),truncateValue(W),prev[3]||'',colY[i][0],colZ[i][0]]);
+  /* -------- Old override block (U–Z) -------- */
+  const old = sh.getRange(2, OV_START, last - 1, OV_COLS).getValues();
+  const byId = new Map();                         // task_id_copy → old U–Z row
+  old.forEach(r => { const k = String(r[0]).trim(); if (k) byId.set(k, r); });
+
+  /* -------- Fresh sheet columns we need -------- */
+  const colA = sh.getRange(2,  1, last - 1).getValues(); // task_id
+  const colC = sh.getRange(2,  3, last - 1).getValues(); // extracted_problem
+  const colI = sh.getRange(2,  9, last - 1).getValues(); // annotator_solution
+  const colJ = sh.getRange(2, 10, last - 1).getValues(); // corrected_problem
+
+  /* -------- Build new override block -------- */
+  const block = [];
+
+  for (let i = 0; i < last - 1; i++) {
+    const id   = String(colA[i][0]).trim();
+    const prev = byId.get(id) || Array(OV_COLS).fill('');
+
+    const U = id;                                                   // always sync
+    const V = prev[1] ||
+              (colJ[i][0] && String(colJ[i][0]).trim().toUpperCase() !== 'N/A'
+                 ? colJ[i][0]
+                 : colC[i][0]);
+    const W = prev[2] || colI[i][0];
+    const X = prev[3] || '';                                        // preserve if exists
+    const Y = prev[4] || '';                                        // preserve if exists
+    const Z = prev[5] || '';                                        // preserve if exists
+
+    block.push([truncateValue(U), truncateValue(V), truncateValue(W), X, Y, Z]);
   }
-  sh.getRange(2,21,n,6).setValues(blk);
+
+  /* -------- Write back U–Z in one shot -------- */
+  sh.getRange(2, OV_START, block.length, OV_COLS).setValues(block);
 }
+
 
 /* =========================================================== */
 /* UTIL to build corpus (Solutions & Extractions)              */
