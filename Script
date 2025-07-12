@@ -1,24 +1,22 @@
 /******************************************************************
- *  MASTER PIPELINE SCRIPT  v 5.6
+ *  MASTER PIPELINE SCRIPT  v 7.0  (2025-07-11)
  *  --------------------------------------------------------------
- *  • Truncates any string > 50 000 chars before writing to Sheets
- *
- *  Pipelines
- *  ① Completed Extractions
- *  ② Approved & Completed Solutions
+ *  • Extractions audit override block AA-AF (stable)
+ *  • Solutions audit override block U-Z (Y & Z fully preserved)
+ *  • Header-safe, hidden-safe overwriteSheet
+ *  • Checkbox → full name (AD→AE, X→Z)
+ *  • 50 000-char truncator to avoid cell-length errors
  ******************************************************************/
 
-/* ──────────────────────────────────────────────────────────── */
-/*                       GLOBAL LIMIT                          */
+/* ---------- GLOBAL CONSTANTS ---------- */
 const MAX_CELL_LENGTH = 50000;
 const truncateValue  = v =>
   (typeof v === 'string' && v.length > MAX_CELL_LENGTH) ? v.slice(0, MAX_CELL_LENGTH) : v;
-const truncateMatrix = M => M.map(r => r.map(truncateValue));
+const truncateMatrix = m => m.map(r => r.map(truncateValue));
 
-/* ──────────────────────────────────────────────────────────── */
-/*                       CONFIGURATION                         */
+/* ---------- CONFIG ---------- */
 const CFG = {
-  /* Completed Extractions */
+  /* Extractions */
   CONNECTED_SHEET   : 'All Problems in Solutions - Ext',
   PENDING_SHEET     : 'Completed Extractions',
   CLEANED_SHEET     : 'Completed Extractions - Cleaned',
@@ -27,23 +25,23 @@ const CFG = {
   SOLN_SHEET        : 'Completed Extractions -> Solutions',
   HOLD_SHEET        : 'Completed Extractions -> Holding',
 
-  /* Approved & Completed Solutions */
+  /* Solutions */
   SOL_PENDING_SHEET : 'Approved and Completed Solutions - Ext',
   SOL_ALL_SHEET     : 'Delivered Solutions - Ext',
   SOL_CLEANED_SHEET : 'Approved and Completed Solutions - Cleaned',
   SOL_AUDIT_SHEET   : 'Clean Solutions Audit',
   SOL_PAUSE_SHEET   : 'Solutions -> Pause',
 
-  /* Columns and thresholds */
+  /* Shared */
   ALL_ID_COLS       : ['original_task_id', 'problem_id'],
   PENDING_ID_COLS   : ['task_id', 'problem_id'],
   TEXT_COL          : 'problem',
-  PENDING_CHECKED_COL : null,   // set to header if you want a “checked” flag
-  SIM_THRESHOLD       : 0.90
+
+  /* Other */
+  SIM_THRESHOLD     : 0.90                // cosine/Jaccard similarity cut
 };
 
-/* ──────────────────────────────────────────────────────────── */
-/*                       MENU ENTRIES                          */
+/* ---------- MENU ---------- */
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Task Tools')
@@ -52,8 +50,7 @@ function onOpen() {
     .addToUi();
 }
 
-/* ──────────────────────────────────────────────────────────── */
-/*                  COMMON: REFRESH CONNECTED SHEETS           */
+/* ---------- REFRESH ---------- */
 function refreshConnectedData() {
   SpreadsheetApp.enableBigQueryExecution();
   SpreadsheetApp.getActiveSpreadsheet().refreshAllDataSources();
@@ -61,315 +58,309 @@ function refreshConnectedData() {
 }
 
 /* =========================================================== */
-/* ①  COMPLETED EXTRACTIONS PIPELINE                           */
+/*  SHARED LOW-LEVEL HELPERS                                    */
+/* =========================================================== */
+/**
+ * overwriteSheet
+ *  • Clears rows 2↓ only in the script-owned columns
+ *  • Rewrites row 1 header for all script columns
+ *  • Writes fresh data only through the last owned column
+ *  • Restores hidden sheets to hidden state
+ *
+ * @param {SpreadsheetApp.Spreadsheet} ss
+ * @param {string}  name      Target sheet name
+ * @param {string[]} headers   Header row the script owns
+ * @param {any[][]} rows       Data rows to write
+ */
+function overwriteSheet(ss, name, headers, rows) {
+  const sh = ss.getSheetByName(name) || ss.insertSheet(name);
+  const wasHidden = sh.isSheetHidden();
+
+  /* Decide how many columns we OWN (everything left of manual overrides) */
+  let owned = headers.length;               // default (e.g. Cleaned sheets)
+
+  if (name === CFG.AUDIT_VIEW_SHEET) owned = 25; // A…Y   (leave AA-AF intact)
+  if (name === CFG.SOL_AUDIT_SHEET)  owned = 20; // A…T   (leave U-Z intact)
+
+  /* 1⃣  Clear existing rows in OWNED columns only */
+  const curRows = sh.getMaxRows();
+  if (curRows > 1) {
+    sh.getRange(2, 1, curRows - 1, owned).clearContent();
+  }
+
+  /* 2⃣  Rewrite header row (A…headers.length) */
+  sh.getRange(1, 1, 1, headers.length)
+    .setValues([truncateMatrix([headers])[0]]);
+
+  /* 3⃣  Spill NEW data into A…OWNED  ← **patch is here** */
+  if (rows.length) {
+    const trimmed = rows.map(r => r.slice(0, owned)); // cut to owned width
+    sh.getRange(2, 1, trimmed.length, owned)
+      .setValues(truncateMatrix(trimmed));
+  } else {
+    sh.getRange(2, 1).setValue('No rows');
+  }
+
+  /* 4⃣  Freeze header & restore hidden state */
+  sh.setFrozenRows(1);
+  if (wasHidden) sh.hideSheet();
+}
+
+
+function writeRaw(ss, name, headers, rows) {
+  const raw = ss.getSheetByName(name) || ss.insertSheet(name);
+  raw.clearContents();
+  if (rows.length) {
+    raw.getRange(1, 1, 1, headers.length).setValues([truncateMatrix([headers])[0]]);
+    raw.getRange(2, 1, rows.length, headers.length).setValues(truncateMatrix(rows));
+  }
+  raw.hideSheet();
+}
+
+/* Token / similarity helpers */
+const canonical=t=>String(t||'').trim().toLowerCase()
+  .replace(/’/g,"'").replace(/[“”]/g,'"')
+  .replace(/\u2212/g,'-').replace(/\xa0/g,' ')
+  .replace(/[^\w\s]/g,' ').replace(/\s+/g,' ');
+const tokens=t=>canonical(t).split(' ').filter(w=>w.length>=3);
+const norm   =v=>{const s=String(v??'').trim(); return s&&!/^(null|n\/?a)$/i.test(s)?s:'';};
+const jaccard=(A,B)=>{const a=new Set(A),b=new Set(B);const i=[...a].filter(x=>b.has(x)).length;return i/(a.size+b.size-i||1);};
+const truthy =v=>v===true||v==='TRUE'||v==='true';
+
+/* =========================================================== */
+/* ① COMPLETED EXTRACTIONS PIPELINE                             */
 /* =========================================================== */
 function runAllExtractions() {
   refreshConnectedData();
   cleanCompletedExtracts();
-  syncOverrides();
+  syncOverrides();                         // AA-AF
   SpreadsheetApp.getUi().alert('✅ Completed Extractions pipeline complete!');
 }
 
 function cleanCompletedExtracts() {
   const ss = SpreadsheetApp.getActive();
 
-  /* build corpus */
+  /* Corpus of *all* Solutions problems */
   const corpus = loadCorpus(
     ss.getSheetByName(CFG.CONNECTED_SHEET),
     CFG.ALL_ID_COLS,
     CFG.TEXT_COL
   );
-  const corpusIds = new Set(
-    corpus.flatMap(c => [c.id1, c.id2]).filter(Boolean)
-  );
-  const corpusTok = corpus.map(c => c.tok);
+  const corpusIds = new Set(corpus.flatMap(c=>[c.id1,c.id2]).filter(Boolean));
+  const corpusTok = corpus.map(c=>c.tok);
 
-  /* load pending */
-  const pSh   = ss.getSheetByName(CFG.PENDING_SHEET);
-  const pVals = pSh.getDataRange().getValues();
-  const pHead = pVals[0], pRows = pVals.slice(1);
+  /* Pending Extractions */
+  const pSh = ss.getSheetByName(CFG.PENDING_SHEET);
+  const V   = pSh.getDataRange().getValues(), H = V[0], R = V.slice(1);
+  const i   = { task:H.indexOf('task_id'),
+                pid :H.indexOf('problem_id'),
+                txt :H.indexOf('problem'),
+                prob:H.indexOf('problematic_task'),
+                agree:H.indexOf('model_solution_agreement') };
 
-  const col = h => {
-    const idx = pHead.indexOf(h);
-    if (idx === -1) throw `Missing column "${h}" in ${CFG.PENDING_SHEET}`;
-    return idx;
-  };
-  const idx = {
-    id1  : col(CFG.PENDING_ID_COLS[0]),
-    id2  : col(CFG.PENDING_ID_COLS[1]),
-    text : col(CFG.TEXT_COL),
-    prob : col('problematic_task'),
-    agree: col('model_solution_agreement')
-  };
-  const chkIdx = CFG.PENDING_CHECKED_COL ? col(CFG.PENDING_CHECKED_COL) : null;
+  const HEAD=[...H,'is_exact_duplicate_id','matching_ids','is_near_duplicate','nearest_task_id','similarity'];
+  const out=[];
+  R.forEach(r=>{
+    const matches=[], tID=norm(r[i.task]), pID=norm(r[i.pid]);
+    if(tID&&corpusIds.has(tID)) matches.push(tID);
+    if(pID&&corpusIds.has(pID)) matches.push(pID);
+    const exact=matches.length>0;
 
-  const head = [...pHead,
-    'is_exact_duplicate_id',        // P
-    'matching_ids',                 // Q
-    'is_near_duplicate',            // R
-    'nearest_task_id',              // S
-    'similarity'                    // T
-  ];
+    const tok=tokens(r[i.txt]);
+    let best=0,bI=-1;
+    corpusTok.forEach((t,idx)=>{const s=jaccard(tok,t); if(s>best){best=s;bI=idx;}});
+    const near=best>=CFG.SIM_THRESHOLD;
+    const nearest=near?corpus[bI].id1:'';
 
-  const out = [];
-
-  pRows.forEach((row, rIdx) => {
-    if (chkIdx !== null && row[chkIdx]) {
-      out.push([...row, '', '', '', '', '']);
-      return;
-    }
-
-    /* exact duplicate */
-    const matches = [];
-    const id1 = normId(row[idx.id1]), id2 = normId(row[idx.id2]);
-    if (id1 && corpusIds.has(id1)) matches.push(id1);
-    if (id2 && corpusIds.has(id2)) matches.push(id2);
-    const exact = matches.length > 0;
-
-    /* near duplicate */
-    const tok = tokens(row[idx.text]);
-    let best = 0, bI = -1;
-    corpusTok.forEach((t, i) => {
-      const s = jaccard(tok, t);
-      if (s > best) { best = s; bI = i; }
-    });
-    const near = best >= CFG.SIM_THRESHOLD;
-    const nearestTask = near ? corpus[bI].id1 || '' : '';
-
-    if (chkIdx !== null) pSh.getRange(rIdx + 2, chkIdx + 1).setValue(true);
-
-    out.push([
-      ...row,
-      exact,
-      matches.join(','),
-      near,
-      nearestTask,
-      best.toFixed(3)
-    ]);
+    out.push([...r, exact, matches.join(','), near, nearest, best.toFixed(3)]);
   });
 
-  overwriteSheet(ss, CFG.CLEANED_SHEET, head, out);
-  partitionRows(ss, head, out);
-}
+  overwriteSheet(ss, CFG.CLEANED_SHEET, HEAD, out);
 
-function partitionRows(ss, head, rows) {
-  const idx = h => head.indexOf(h);
-  const iProb  = idx('problematic_task');
-  const iAgree = idx('model_solution_agreement');
-  const iExact = idx('is_exact_duplicate_id');
-  const iNear  = idx('is_near_duplicate');
-
-  const audit = [], soln = [], hold = [];
-
-  rows.forEach(r => {
-    const ok  = String(r[iProb]).trim() === 'No issues with task!';
-    const dup = truthy(r[iExact]) || truthy(r[iNear]);
-
-    if (ok && !dup && String(r[iAgree]).trim() === 'Yes')      audit.push(r);
-    else if (ok && !dup && String(r[iAgree]).trim() !== 'Yes') soln.push(r);
-    else                                                       hold.push(r);
+  /* Partition */
+  const iExact=HEAD.indexOf('is_exact_duplicate_id'),
+        iNear =HEAD.indexOf('is_near_duplicate'),
+        iProb =HEAD.indexOf('problematic_task'),
+        iAgree=HEAD.indexOf('model_solution_agreement');
+  const audit=[], soln=[], hold=[];
+  const OK="No issues with task!";
+  out.forEach(r=>{
+    const dup=truthy(r[iExact])||truthy(r[iNear]);
+    const good=String(r[iProb]).trim()===OK;
+    const agree=String(r[iAgree]).trim()==='Yes';
+    if(good && !dup && agree) audit.push(r);
+    else if(good && !dup)     soln.push(r);
+    else                      hold.push(r);
   });
 
-  writeRaw      (ss, CFG.AUDIT_RAW_SHEET, head, audit);
-  ensureAuditView(ss, head);
-  overwriteSheet(ss, CFG.SOLN_SHEET, head, soln);
-  overwriteSheet(ss, CFG.HOLD_SHEET, head, hold);
+  writeRaw      (ss, CFG.AUDIT_RAW_SHEET, HEAD, audit);
+  ensureAuditView(ss, HEAD);
+  overwriteSheet(ss, CFG.SOLN_SHEET, HEAD, soln);
+  overwriteSheet(ss, CFG.HOLD_SHEET, HEAD, hold);
 }
 
+/* AA-AF override realignment */
 function syncOverrides() {
-  const ss = SpreadsheetApp.getActive();
-  const sh = ss.getSheetByName(CFG.AUDIT_VIEW_SHEET);
-  if (!sh) return;
-
-  const last = sh.getLastRow();
-  if (last < 2) return;
-
-  const task = sh.getRange(2, 1,  last-1).getValues(); // A
-  const prob = sh.getRange(2, 2,  last-1).getValues(); // B
-  const corr = sh.getRange(2,13,  last-1).getValues(); // M
-  const sol  = sh.getRange(2,17,  last-1).getValues(); // Q
-
-  const AA = sh.getRange(2,27,last-1).getValues();     // AA
-  const AB = sh.getRange(2,28,last-1).getValues();     // AB
-  const AC = sh.getRange(2,29,last-1).getValues();     // AC
-
-  let wA=false,wB=false,wC=false;
-
-  const newAA = AA.map((r,i)=>{
-    if(!r[0] && task[i][0]!==''){ wA=true; return [truncateValue(task[i][0])];}
-    return [r[0]];
-  });
-  const newAB = AB.map((r,i)=>{
-    if(!r[0]){
-      const m=String(corr[i][0]||'').trim();
-      const v=(m && m.toUpperCase()!=='N/A') ? m : prob[i][0];
-      if(v!=='') wB=true;
-      return [truncateValue(v)];
-    }
-    return [r[0]];
-  });
-  const newAC = AC.map((r,i)=>{
-    if(!r[0] && sol[i][0]!==''){ wC=true; return [truncateValue(sol[i][0])];}
-    return [r[0]];
-  });
-
-  if(wA) sh.getRange(2,27,newAA.length,1).setValues(newAA);
-  if(wB) sh.getRange(2,28,newAB.length,1).setValues(newAB);
-  if(wC) sh.getRange(2,29,newAC.length,1).setValues(newAC);
+  const sh=SpreadsheetApp.getActive().getSheetByName(CFG.AUDIT_VIEW_SHEET);
+  if(!sh) return;
+  const n=sh.getLastRow()-1; if(n<1) return;
+  const old=sh.getRange(2,27,n,6).getValues();   // AA-AF
+  const map=new Map(); old.forEach(r=>{const k=String(r[0]).trim();if(k)map.set(k,r)});
+  const id = sh.getRange(2,1,n).getValues(),
+        pr = sh.getRange(2,2,n).getValues(),
+        cp = sh.getRange(2,13,n).getValues(),
+        mp = sh.getRange(2,17,n).getValues();
+  const blk=[];
+  for(let i=0;i<n;i++){
+    const key=String(id[i][0]).trim(), prev=map.get(key)||Array(6).fill('');
+    blk.push([
+      key,
+      prev[1]||(cp[i][0]&&String(cp[i][0]).trim().toUpperCase()!=='N/A'?cp[i][0]:pr[i][0]),
+      prev[2]||mp[i][0],
+      prev[3]||'', prev[4]||'', prev[5]||''
+    ].map(truncateValue));
+  }
+  sh.getRange(2,27,n,6).setValues(blk);
 }
 
-function ensureAuditView(ss, headers) {
-  const colCount = headers.length;
-  const view = ss.getSheetByName(CFG.AUDIT_VIEW_SHEET) || ss.insertSheet(CFG.AUDIT_VIEW_SHEET);
-  view.showSheet();
-
-  view.getRange(1, 1, 1, colCount).setValues([truncateMatrix([headers])[0]]);
-  view.getRange(2, 1, view.getMaxRows() - 1, colCount).clearContent();
-
-  const rawEsc = CFG.AUDIT_RAW_SHEET.replace(/'/g,"''");
-  const rng    = `'${rawEsc}'!A2:${String.fromCharCode(64 + colCount)}`;
-  view.getRange('A2').setFormula(`=FILTER(${rng}, LEN('${rawEsc}'!A2:A))`);
-  view.setFrozenRows(1);
+/* Show/hide audit view */
+function ensureAuditView(ss,HEAD){
+  const n=HEAD.length,
+        view=ss.getSheetByName(CFG.AUDIT_VIEW_SHEET)||ss.insertSheet(CFG.AUDIT_VIEW_SHEET);
+  view.getRange(1,1,1,n).setValues([truncateMatrix([HEAD])[0]]);
+  view.getRange(2,1,view.getMaxRows()-1,n).clearContent();
+  const esc=CFG.AUDIT_RAW_SHEET.replace(/'/g,"''");
+  view.getRange('A2').setFormula(`=FILTER('${esc}'!A2:${String.fromCharCode(64+n)},LEN('${esc}'!A2:A))`);
+  view.setFrozenRows(1); view.hideSheet();
 }
 
 /* =========================================================== */
-/* ②  APPROVED & COMPLETED SOLUTIONS PIPELINE                  */
+/* ② APPROVED & COMPLETED SOLUTIONS PIPELINE                    */
 /* =========================================================== */
 function runSolutions() {
   refreshConnectedData();
   cleanApprovedCompletedSolutions();
+  syncSolutionsOverrides();            // U-Z
   SpreadsheetApp.getUi().alert('✅ Approved & Completed Solutions pipeline complete!');
 }
 
 function cleanApprovedCompletedSolutions() {
-  const ss = SpreadsheetApp.getActive();
+  const ss=SpreadsheetApp.getActive();
 
-  /* ALL reference */
-  const allSh = ss.getSheetByName(CFG.SOL_ALL_SHEET);
-  if (!allSh) throw `Sheet "${CFG.SOL_ALL_SHEET}" not found`;
-  const allV  = allSh.getDataRange().getValues();
-  const hA    = allV[0], rA = allV.slice(1);
-  const ia = { task:hA.indexOf('task_id'), pid:hA.indexOf('problem_id'), prob:hA.indexOf('problem') };
-  const allTok = rA.map(r=>tokens(canonical(r[ia.prob])));
-  const allIds = new Set(rA.flatMap(r=>[normId(r[ia.task]), normId(r[ia.pid])]).filter(Boolean));
+  /* corpus */
+  const all=loadCorpus(
+    ss.getSheetByName(CFG.SOL_ALL_SHEET),
+    ['task_id','problem_id'],
+    CFG.TEXT_COL
+  );
+  const ids=new Set(all.flatMap(c=>[c.id1,c.id2]).filter(Boolean));
+  const tokArr=all.map(c=>c.tok);
 
-  /* PENDING rows */
-  const pSh = ss.getSheetByName(CFG.SOL_PENDING_SHEET);
-  if (!pSh) throw `Sheet "${CFG.SOL_PENDING_SHEET}" not found`;
-  const pV  = pSh.getDataRange().getValues();
-  const hP  = pV[0], rP = pV.slice(1);
-  const ip  = {
-    task : hP.indexOf('task_id'),            // A
-    pid  : hP.indexOf('problem_id'),         // B
-    extp : hP.indexOf('extracted_problem'),  // C
-    sol  : hP.indexOf('annotator_solution'), // I
-    corr : hP.indexOf('corrected_problem'),  // J
-    pflag: hP.indexOf('problematic_task')    // K (or actual index)
-  };
+  /* pending */
+  const pSh=ss.getSheetByName(CFG.SOL_PENDING_SHEET);
+  const V=pSh.getDataRange().getValues(), H=V[0], R=V.slice(1);
+  const ix={task:H.indexOf('task_id'), pid:H.indexOf('problem_id'),
+            ext:H.indexOf('extracted_problem'),
+            sol:H.indexOf('annotator_solution'),
+            cor:H.indexOf('corrected_problem'),
+            flag:H.indexOf('problematic_task')};
 
-  /* Build Cleaned dataset */
-  const cleanedHead = [...hP,
-    'is_exact_duplicate_id','matching_ids',
-    'is_near_duplicate','nearest_task_id','similarity'];
+  const HEAD=[...H,'is_exact_duplicate_id','matching_ids','is_near_duplicate','nearest_task_id','similarity'];
+  const pending=[];
+  R.forEach(r=>{
+    const matches=[], tID=norm(r[ix.task]), pID=norm(r[ix.pid]);
+    if(tID&&ids.has(tID)) matches.push(tID);
+    if(pID&&ids.has(pID)) matches.push(pID);
+    const exact=matches.length>0;
 
-  const cleanedRows = rP.map(r=>{
-    /* exact dup */
-    const matches=[];
-    const tID=normId(r[ip.task]), pID=normId(r[ip.pid]);
-    if(tID&&allIds.has(tID)) matches.push(tID);
-    if(pID&&allIds.has(pID)) matches.push(pID);
-    const exact = matches.length>0;
+    const tok=tokens(r[ix.ext]), sims=tokArr.map(t=>jaccard(tok,t));
+    const best=Math.max(...sims), bestI=sims.indexOf(best);
+    const near=best>=CFG.SIM_THRESHOLD, nearest=near?all[bestI].id1:'';
 
-    /* near dup */
-    const tok = tokens(canonical(r[ip.extp]));
-    let best=0,bI=-1;
-    allTok.forEach((t,i)=>{const s=jaccard(tok,t); if(s>best){best=s;bI=i;}});
-    const near    = best >= CFG.SIM_THRESHOLD;
-    const nearest = near ? normId(rA[bI][ia.task]) : '';
-
-    return [...r, exact, matches.join(','), near, nearest, best.toFixed(3)];
+    pending.push([...r,exact,matches.join(','),near,nearest,best.toFixed(3)]);
   });
 
-  overwriteSheet(ss, CFG.SOL_CLEANED_SHEET, cleanedHead, cleanedRows);
+  overwriteSheet(ss, CFG.SOL_CLEANED_SHEET, HEAD, pending);
 
-  /* Partition -> Audit / Pause */
-  const iExact = cleanedHead.indexOf('is_exact_duplicate_id');
-  const iNear  = cleanedHead.indexOf('is_near_duplicate');
-  const iFlag  = cleanedHead.indexOf('problematic_task');
-  const target = "No issues with problem! I will solve this problem like usual.";
+  /* partition */
+  const iExact=HEAD.indexOf('is_exact_duplicate_id'),
+        iNear =HEAD.indexOf('is_near_duplicate'),
+        iFlag =HEAD.indexOf('problematic_task');
+  const OK="No issues with problem! I will solve this problem like usual.";
 
-  const auditHead = [...cleanedHead, 'task_id_copy', 'corrected_problem', 'annotator_solution'];
+  const AUD_HEAD=[...HEAD,'task_id_copy','corrected_problem','annotator_solution'];
   const audit=[], pause=[];
-
-  cleanedRows.forEach(r=>{
-    const flag = String(r[iFlag]).trim();
-    const msgOK = flag === target || flag === '';
-    const dup   = truthy(r[iExact]) || truthy(r[iNear]);
-
-    if (!dup && msgOK) {
-      audit.push([
-        ...r,
-        truncateValue(r[ip.task]),
-        truncateValue(
-          (r[ip.corr] && String(r[ip.corr]).trim().toUpperCase() !== 'N/A')
-            ? r[ip.corr] : r[ip.extp]
-        ),
-        truncateValue(r[ip.sol])
+  pending.forEach(r=>{
+    const dup = truthy(r[iExact])||truthy(r[iNear]);
+    const good= String(r[iFlag]).trim()===OK || String(r[iFlag]).trim()==='';
+    if(!dup&&good){
+      audit.push([...r,
+        truncateValue(r[ix.task]),
+        truncateValue((r[ix.cor]&&String(r[ix.cor]).trim().toUpperCase()!=='N/A')?r[ix.cor]:r[ix.ext]),
+        truncateValue(r[ix.sol])
       ]);
-    } else {
-      pause.push(r);
-    }
+    } else pause.push(r);
   });
 
-  overwriteSheet(ss, CFG.SOL_AUDIT_SHEET, auditHead, audit);
-  overwriteSheet(ss, CFG.SOL_PAUSE_SHEET, cleanedHead, pause);
+  overwriteSheet(ss, CFG.SOL_AUDIT_SHEET, AUD_HEAD, audit);
+  overwriteSheet(ss, CFG.SOL_PAUSE_SHEET, HEAD, pause);
+}
+
+/* ---------- U-Z override realignment ---------- */
+function syncSolutionsOverrides() {
+  const sh=SpreadsheetApp.getActive().getSheetByName(CFG.SOL_AUDIT_SHEET);
+  if(!sh) return;
+  const n=sh.getLastRow()-1; if(n<1) return;
+
+  const old=sh.getRange(2,21,n,6).getValues();     // U-Z existing
+  const map=new Map(); old.forEach(r=>{const k=String(r[0]).trim(); if(k) map.set(k,r);});
+
+  const colA=sh.getRange(2,1,n).getValues(),  // task_id
+        colC=sh.getRange(2,3,n).getValues(),  // extracted_problem
+        colI=sh.getRange(2,9,n).getValues(),  // annotator_solution
+        colJ=sh.getRange(2,10,n).getValues(), // corrected_problem
+        colY=sh.getRange(2,25,n).getValues(), // Y manual
+        colZ=sh.getRange(2,26,n).getValues(); // Z manual
+
+  const blk=[];
+  for(let i=0;i<n;i++){
+    const id=String(colA[i][0]).trim();
+    const prev=map.get(id)||Array(6).fill('');
+    const U=id;
+    const V=prev[1]||(colJ[i][0]&&String(colJ[i][0]).trim().toUpperCase()!=='N/A'?colJ[i][0]:colC[i][0]);
+    const W=prev[2]||colI[i][0];
+    blk.push([truncateValue(U),truncateValue(V),truncateValue(W),prev[3]||'',colY[i][0],colZ[i][0]]);
+  }
+  sh.getRange(2,21,n,6).setValues(blk);
 }
 
 /* =========================================================== */
-/*                     GENERIC SHEET HELPERS                   */
+/* UTIL to build corpus (Solutions & Extractions)              */
 /* =========================================================== */
-function overwriteSheet(ss, name, headers, rows) {
-  const sh = ss.getSheetByName(name) || ss.insertSheet(name);
-  sh.showSheet();
-  sh.clearContents();
-  if (rows.length) {
-    sh.getRange(1, 1, 1, headers.length)
-      .setValues([truncateMatrix([headers])[0]]);
-    sh.getRange(2, 1, rows.length, headers.length)
-      .setValues(truncateMatrix(rows));
-  } else {
-    sh.getRange(1,1).setValue('No rows');
-  }
-  sh.setFrozenRows(1);
-}
-function writeRaw(ss,name,hdr,rows){
-  const raw=ss.getSheetByName(name)||ss.insertSheet(name);
-  raw.hideSheet(); raw.clearContents();
-  if(rows.length){
-    raw.getRange(1,1,1,hdr.length).setValues([truncateMatrix([hdr])[0]]);
-    raw.getRange(2,1,rows.length,hdr.length).setValues(truncateMatrix(rows));
-  }
-}
-
-/* =========================================================== */
-/*                          UTILITIES                          */
-/* =========================================================== */
-function loadCorpus(sh, idCols, txtCol){
+function loadCorpus(sh,idCols,txtCol){
   const V=sh.getDataRange().getValues(), H=V[0];
-  const i1=H.indexOf(idCols[0]), i2=H.indexOf(idCols[1]), t=H.indexOf(txtCol);
-  return V.slice(1).map(r=>({
-    id1:normId(r[i1]),
-    id2:normId(r[i2]),
-    tok:tokens(canonical(r[t]))
-  }));
+  const i1=H.indexOf(idCols[0]), i2=H.indexOf(idCols[1]), it=H.indexOf(txtCol);
+  return V.slice(1).map(r=>({id1:norm(r[i1]),id2:norm(r[i2]),tok:tokens(canonical(r[it]))}));
 }
-const normId=v=>{const s=String(v??'').trim();return s&&!/^(null|n\/?a)$/i.test(s)?s:'';};
-const canonical=t=>String(t||'').trim().toLowerCase()
-  .replace(/’/g,"'").replace(/[“”]/g,'"')
-  .replace(/\u2212/g,'-').replace(/\xa0/g,' ')
-  .replace(/[^\w\s]/g,' ').replace(/\s+/g,' ');
-const tokens=t=>canonical(t).split(' ').filter(w=>w.length>=3);
-const jaccard=(A,B)=>{const a=new Set(A), b=new Set(B);
-  const i=[...a].filter(x=>b.has(x)).length;
-  return i/(a.size+b.size-i||1);};
-const truthy=v=>v===true||v==='TRUE'||v==='true';
+
+/* =========================================================== */
+/* onEdit: checkbox ✓ → full name                              */
+/* =========================================================== */
+function onEdit(e){
+  const map={
+    'Completed Extractions -> Audit for delivery':{ cb:30, name:31 },
+    'Clean Solutions Audit':                       { cb:24, name:26 }
+  };
+  const cfg=map[e.range.getSheet().getName()]; if(!cfg) return;
+  if(e.range.getColumn()!==cfg.cb) return;
+  if(!e.range.isChecked())        return;
+  const full=getFullName(Session.getActiveUser().getEmail()||'');
+  if(full) e.range.getSheet().getRange(e.range.getRow(),cfg.name).setValue(full);
+}
+function getFullName(email){
+  const local=email.split('@')[0];
+  if(local.includes('.')){const [f,l]=local.split('.'); return `${cap(f)} ${cap(l)}`;}
+  const m=local.match(/^([a-z])[_]?([a-z]+)/i); if(m) return `${cap(m[1])} ${cap(m[2])}`;
+  return cap(local);
+}
+const cap=s=>s?s[0].toUpperCase()+s.slice(1):'';
