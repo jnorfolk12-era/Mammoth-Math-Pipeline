@@ -289,32 +289,54 @@ function cleanApprovedCompletedSolutions() {
   overwriteSheet(ss, CFG.SOL_PAUSE_SHEET, HEAD, pause);
 }
 
+/* ------------------------------------------------------------------ */
+/*  U–Z override realignment  (Solutions Audit)                       */
+/*  W now comes from column H (index 8)                               */
+/* ------------------------------------------------------------------ */
 function syncSolutionsOverrides() {
-  const sh=SpreadsheetApp.getActive().getSheetByName(CFG.SOL_AUDIT_SHEET);
-  if(!sh) return;
-  const n=sh.getLastRow()-1; if(n<1) return;
+  const OV_START = 21;   // U
+  const OV_COLS  = 6;    // U…Z
 
-  const old=sh.getRange(2,21,n,6).getValues();
-  const map=new Map(); old.forEach(r=>{const k=String(r[0]).trim(); if(k) map.set(k,r);});
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(CFG.SOL_AUDIT_SHEET);
+  if (!sh) return;
 
-  const id=sh.getRange(2,1,n).getValues(),
-        ep=sh.getRange(2,3,n).getValues(),
-        as=sh.getRange(2,9,n).getValues(),
-        cp=sh.getRange(2,10,n).getValues();
+  const last = sh.getLastRow();
+  if (last < 2) return;
 
-  const blk=[];
-  for(let i=0;i<n;i++){
-    const key=String(id[i][0]).trim();
-    const prev=map.get(key)||Array(6).fill('');
-    blk.push([
-      trunc(key),
-      trunc(prev[1]||(cp[i][0]&&String(cp[i][0]).trim().toUpperCase()!=='N/A'?cp[i][0]:ep[i][0])),
-      trunc(prev[2]||as[i][0]),
-      prev[3]||'', prev[4]||'', prev[5]||''
-    ]);
+  /* old override block */
+  const old = sh.getRange(2, OV_START, last - 1, OV_COLS).getValues();
+  const byId = new Map();
+  old.forEach(r => { const k = String(r[0]).trim(); if (k) byId.set(k, r); });
+
+  /* fresh sheet columns we need */
+  const colA = sh.getRange(2,  1, last - 1).getValues(); // task_id
+  const colC = sh.getRange(2,  3, last - 1).getValues(); // extracted_problem
+  const colH = sh.getRange(2,  8, last - 1).getValues(); // *** column H ***
+  const colJ = sh.getRange(2, 10, last - 1).getValues(); // corrected_problem
+
+  const block = [];
+
+  for (let i = 0; i < last - 1; i++) {
+    const id   = String(colA[i][0]).trim();
+    const prev = byId.get(id) || Array(OV_COLS).fill('');
+
+    const U = id;
+    const V = prev[1] ||
+              (colJ[i][0] && String(colJ[i][0]).trim().toUpperCase() !== 'N/A'
+                 ? colJ[i][0]
+                 : colC[i][0]);
+    const W = prev[2] || colH[i][0];          // ← now uses column H
+    const X = prev[3] || '';
+    const Y = prev[4] || '';
+    const Z = prev[5] || '';
+
+    block.push([trunc(U), trunc(V), trunc(W), X, Y, Z]);
   }
-  sh.getRange(2,21,n,6).setValues(blk);
+
+  sh.getRange(2, OV_START, block.length, OV_COLS).setValues(block);
 }
+
 
 /* =========================================================== */
 /*  onEdit checkbox ✓ → full name                              */
